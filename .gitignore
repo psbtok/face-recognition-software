@@ -3,3 +3,5 @@ yolov3.weights
 predictors
 *.jpg
 facial_features.json
+sandbox.ipynb
+test.py

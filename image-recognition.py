@@ -1,21 +1,15 @@
 import cv2
 import numpy as np
-import os
-import time
 import json
+import time
+import os
 import dlib
-
-# Option to flip the image horizontally
-flip_horizontally = True  # Set to True to enable horizontal flip
+from sort import SortTracker  # Import SortTracker from sort-tracker
 
 # Paths to the YOLO configuration, weights, and coco names files
-config_path = 'yolov3.cfg'
-weights_path = 'yolov3.weights'
-class_names_path = 'coco.names'
-
-# Check if the class names file exists
-if not os.path.exists(class_names_path):
-    raise FileNotFoundError(f"{class_names_path} file not found. Please make sure it exists in the specified directory.")
+config_path = 'yolov3.cfg'  # Update with your path to yolov3.cfg
+weights_path = 'yolov3.weights'  # Update with your path to yolov3.weights
+class_names_path = 'coco.names'  # Update with your path to coco.names
 
 # Load YOLO model
 net = cv2.dnn.readNetFromDarknet(config_path, weights_path)
@@ -32,9 +26,15 @@ with open('facial_features.json', 'r') as f:
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor("predictors/shape_predictor_68_face_landmarks.dat")  # Ensure this file is present
 
-# Define the confidence threshold for YOLO and facial recognition
+# Initialize SORT tracker
+tracker = SortTracker(max_age=5, min_hits=3, iou_threshold=0.2)
+
+# Define thresholds
 confidence_threshold = 0.5
 recognition_threshold = 5000  # Threshold for facial recognition similarity
+
+# Option to flip the image horizontally
+flip_horizontally = True
 
 # Function to calculate the Euclidean distance between two sets of landmarks
 def calculate_distance(landmarks1, landmarks2):
@@ -50,7 +50,6 @@ def extract_facial_features(image):
     landmarks_list = []
     
     for face in faces:
-        # Check if the face region is valid
         if face.width() <= 0 or face.height() <= 0:
             continue  # Skip invalid face regions
         
@@ -73,11 +72,13 @@ def recognize_person(landmarks):
             if distance < min_distance:
                 min_distance = distance
                 recognized_name = name
-    # If the distance is below the threshold, recognize the person
+        print(name, distance)
+    
     if min_distance < recognition_threshold:
         return recognized_name
     return None
 
+# Function to detect people using YOLO
 def detect_people(image):
     height, width = image.shape[:2]
     blob = cv2.dnn.blobFromImage(image, 1/255.0, (416, 416), swapRB=True, crop=False)
@@ -86,7 +87,7 @@ def detect_people(image):
     output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 
     detections = net.forward(output_layers)
-    
+
     boxes = []
     confidences = []
     class_ids = []
@@ -108,22 +109,48 @@ def detect_people(image):
     indices = cv2.dnn.NMSBoxes(boxes, confidences, confidence_threshold, 0.4)
 
     result_boxes = []
-    result_class_ids = []
     if len(indices) > 0:
         for i in indices.flatten():
             result_boxes.append(boxes[i])
-            result_class_ids.append(class_ids[i])
 
-    return result_boxes, result_class_ids
+    return result_boxes
 
-def draw_boxes(image, boxes, class_ids, last_recognized_names):
-    for (x, y, w, h), class_id in zip(boxes, class_ids):
-        label = str(classes[class_id])  # Get the class name (which will be 'person')
-        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        # Draw the recognized name for each person
-        if last_recognized_names.get((x, y, w, h)):
-            cv2.putText(image, f"Recognized: {last_recognized_names[(x, y, w, h)]}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    return image
+# Dictionary to keep track of currently visible IDs and recognized names
+recognized_names = {}
+
+# Function to track and draw bounding boxes with IDs
+# Function to track and draw bounding boxes with IDs
+def track_and_draw(image, boxes):
+    if len(boxes) == 0:
+        return  # If no boxes are detected, skip updating the tracker
+
+    dets = np.array([[x, y, x + w, y + h, 1.0, 0] for (x, y, w, h) in boxes])  # Added class ID as 0
+    tracked_objects = tracker.update(dets, 2)
+
+    global recognized_names
+
+    for obj in tracked_objects:
+        if len(obj) >= 5:
+            x1, y1, x2, y2, obj_id = map(int, obj[:5])
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(image, f'ID {obj_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # Check if the person has been recognized before
+            if obj_id not in recognized_names:
+                # Extract face and recognize person
+                face = image[y1:y2, x1:x2]
+                if face.size > 0:
+                    landmarks_list = extract_facial_features(face)
+                    for landmarks in landmarks_list:
+                        recognized_name = recognize_person(landmarks)
+                        if recognized_name:
+                            recognized_names[obj_id] = recognized_name
+                            cv2.putText(image, f'Name: {recognized_name}', (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # If the person was recognized before, display the name
+            if obj_id in recognized_names:
+                cv2.putText(image, f'Name: {recognized_names[obj_id]}', (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
 
 # Try different camera indices to find an available webcam
 cap = None
@@ -138,56 +165,29 @@ if not cap or not cap.isOpened():
     print("Error: Could not open any webcam.")
     exit()
 
-# Variables for real-time frame rate calculation
-prev_time = 0
-
-# Define the interval in seconds for capturing a frame
-capture_interval = 1  # Capture a frame every 1 second (change this value for different intervals)
-
-# Initialize frame count
-frame_count = 0  # Initialize frame count
-
-# Variable to store the last recognized names for each person
-last_recognized_names = {}
-
+# Main loop
 while True:
     ret, frame = cap.read()
     if not ret:
         print("Error: Failed to capture frame.")
         break
+    
+    # Flip frame horizontally if enabled
+    if flip_horizontally:
+        frame = cv2.flip(frame, 1)
 
-    frame_count += 1
-    if frame_count % capture_interval == 0:  # Capture frame at the specified interval
-        # Flip the frame horizontally if the option is enabled
-        if flip_horizontally:
-            frame = cv2.flip(frame, 1)
-        
-        # Detect people (class_id == 0) in the current frame
-        boxes, class_ids = detect_people(frame)
+    # Detect people (class_id == 0) in the current frame
+    boxes = detect_people(frame)
+    
+    # Track and recognize people
+    track_and_draw(frame, boxes)
 
-        # Extract facial features for each detected person
-        for (x, y, w, h) in boxes:
-            face = frame[y:y + h, x:x + w]
-            if face.size == 0:  # Skip if face region is invalid
-                continue
-            
-            landmarks_list = extract_facial_features(face)
-            for landmarks in landmarks_list:
-                # Recognize person based on facial landmarks
-                print("recognizing person")
-                recognized_name = recognize_person(landmarks)
-                if recognized_name:
-                    last_recognized_names[(x, y, w, h)] = recognized_name  # Store name by bounding box
-        
-        # Display recognized images after processing
-        if last_recognized_names:  # If any name has been recognized
-            output_frame = draw_boxes(frame, boxes, class_ids, last_recognized_names)
-            cv2.imshow('Recognized People', output_frame)
+    # Display the resulting frame
+    cv2.imshow("Frame", frame)
 
-    # Break loop on 'q' key press
+    # Press 'q' to quit
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Release the capture and close OpenCV windows
 cap.release()
 cv2.destroyAllWindows()
